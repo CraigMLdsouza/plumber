@@ -1,0 +1,8 @@
+name: optional_reject
+model: {provider: gemini, name: gemini-2.5-flash}
+input: {schema: {text: string}}
+output:
+  schema:
+    result: string
+    optional_field: {type: string, optional: true}
+missing: {strategy: reject}

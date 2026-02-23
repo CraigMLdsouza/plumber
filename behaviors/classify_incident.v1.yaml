@@ -1,0 +1,27 @@
+name: classify_incident
+
+model:
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+
+input:
+  schema:
+    description: string
+
+output:
+  schema:
+    category:
+      type: enum
+      values: [outage, degradation, security, billing, other]
+
+    severity:
+      type: enum
+      values: [sev1, sev2, sev3, sev4]
+
+validation:
+  max_length:
+    category: 20
+
+normalization:
+  lowercase: [category, severity]

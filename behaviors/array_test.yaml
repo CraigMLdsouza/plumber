@@ -1,0 +1,6 @@
+name: array_test
+model: {provider: gemini, name: gemini-2.5-flash}
+input: {schema: {text: string}}
+output:
+  schema:
+    participants: {type: array, items: string}

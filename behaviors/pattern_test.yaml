@@ -1,0 +1,6 @@
+name: pattern_test
+model: {provider: gemini, name: gemini-2.5-flash}
+input: {schema: {text: string}}
+output: {schema: {code: string}}
+validation:
+  pattern: {code: "^[A-Z]{3}-[0-9]{3}$"}

@@ -1,0 +1,4 @@
+name: type_test
+model: {provider: gemini, name: gemini-2.5-flash}
+input: {schema: {value: integer}}
+output: {schema: {value: integer}}

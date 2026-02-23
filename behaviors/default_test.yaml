@@ -1,0 +1,8 @@
+name: default_test
+model: {provider: gemini, name: gemini-2.5-flash}
+input: {schema: {text: string}}
+output:
+  schema:
+    result: string
+    priority: {type: enum, values: [low, medium, high], optional: true}
+defaults: {priority: medium}

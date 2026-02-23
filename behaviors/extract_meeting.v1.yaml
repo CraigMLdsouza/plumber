@@ -1,0 +1,24 @@
+name: extract_meeting
+
+model:
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+
+input:
+  schema:
+    email_text: string
+
+output:
+  schema:
+    date: string
+    time: string
+    participants: string
+    topic: string
+
+validation:
+  max_length:
+    topic: 80
+
+normalization:
+  strip: [date, time, participants, topic]
