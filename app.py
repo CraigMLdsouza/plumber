@@ -20,10 +20,10 @@ import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
+from langchain_community.llms import Ollama
 import yaml
-from google import genai
-from google.genai import types
+# from google import genai
+# from google.genai import types
 
 # ── Error Types ───────────────────────────────────────────────────────────────
 
@@ -245,13 +245,112 @@ def build_user_prompt(input_data: dict) -> str:
 
 # ── Gemini Call ───────────────────────────────────────────────────────────────
 
+def call_model(model_cfg: dict, system_prompt: str, user_prompt: str) -> str:
+    provider = model_cfg.get("provider", "gemini").lower()
+
+    if provider == "gemini":
+        return call_gemini(model_cfg, system_prompt, user_prompt)
+
+    elif provider == "ollama":
+        return call_ollama(model_cfg, system_prompt, user_prompt)
+
+    else:
+        raise BehaviorDefinitionError(
+            f"Unsupported model provider '{provider}'. "
+            "Supported providers: gemini, ollama"
+        )
+
+def call_ollama(model_cfg: dict, system_prompt: str, user_prompt: str) -> str:
+    """
+    Deterministic Ollama execution path.
+    Matches FAIA usage but adds hard constraints required for Plumber:
+    - disables reasoning
+    - limits token generation
+    - prevents slow drift
+    - forces JSON-only completion
+    """
+
+    from langchain_community.llms import Ollama
+
+    model_name  = model_cfg.get("name", "phi3:mini")
+    temperature = float(model_cfg.get("temperature", 0.0))
+
+    log("Calling model", f"{model_name} (LangChain Ollama) [temp={temperature}]", YELLOW)
+    t0 = time.time()
+
+    try:
+        llm = Ollama(
+            model=model_name,
+            temperature=temperature,
+
+            # 🔴 CRITICAL SETTINGS (these make it fast + deterministic)
+            num_predict=256,      # hard cap output length
+            top_p=1,
+            top_k=1,
+            repeat_penalty=1.0,
+            stop=["\n\n", "</think>"],  # kill reasoning traces early
+
+            verbose=False,
+        )
+
+        # FAIA-style prompt composition
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+
+        raw = llm.invoke(full_prompt)
+
+        if not raw:
+            raise ModelExecutionError("Model returned empty response")
+
+        response = raw.strip()
+
+        # -------------------------------------------------
+        # 🧹 Hard cleanup layer (needed for ALL Ollama models)
+        # -------------------------------------------------
+
+        # Remove markdown fences
+        if "```" in response:
+            parts = response.split("```")
+            # take the longest chunk (models often wrap JSON)
+            response = max(parts, key=len).strip()
+
+        # If the model printed 'json' or 'JSON' header, remove it
+        response = re.sub(r"^json\s*", "", response, flags=re.IGNORECASE).strip()
+
+        # Extract the first valid JSON object
+        match = re.search(r"\{.*\}", response, flags=re.DOTALL)
+        if not match:
+            raise ModelExecutionError(
+                f"Model did not return JSON. Raw output:\n{response[:500]}"
+            )
+
+        response = match.group(0)
+
+    except Exception as e:
+        raise ModelExecutionError(f"Ollama execution failed: {e}")
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+    log("Model responded", f"{elapsed_ms}ms", GREEN)
+
+    return response
+
 def call_gemini(model_cfg: dict, system_prompt: str, user_prompt: str) -> str:
+    """
+    Lazy-load Gemini so the runtime works without Google SDK installed.
+    """
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise ModelExecutionError(
+            "Gemini provider requested but google-genai is not installed.\n"
+            "Install it with: pip install google-genai\n"
+            "Or switch the behavior to provider: ollama."
+        )
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise EnvironmentError(
-            "GEMINI_API_KEY environment variable is not set.\n"
-            "  Run: export GEMINI_API_KEY=your_key_here"
-        )
+        raise ModelExecutionError("GEMINI_API_KEY is not set.")
 
     client = genai.Client(api_key=api_key)
     model_name  = model_cfg.get("name", "gemini-2.5-flash")
@@ -261,11 +360,10 @@ def call_gemini(model_cfg: dict, system_prompt: str, user_prompt: str) -> str:
         system_instruction=system_prompt,
         temperature=temperature,
         response_mime_type="application/json",
-        # Disable thinking for deterministic structured output (faster + cheaper)
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
-    log("Calling model", f"{model_name}  [temp={temperature}]", YELLOW)
+    log("Calling model", f"{model_name} (Gemini) [temp={temperature}]", YELLOW)
     t0 = time.time()
 
     response = client.models.generate_content(
@@ -275,29 +373,46 @@ def call_gemini(model_cfg: dict, system_prompt: str, user_prompt: str) -> str:
     )
 
     elapsed_ms = int((time.time() - t0) * 1000)
-    usage = response.usage_metadata
-    log(
-        "Model responded",
-        f"{elapsed_ms}ms  "
-        f"[in={usage.prompt_token_count} tok  out={usage.candidates_token_count} tok]",
-        GREEN,
-    )
+    log("Model responded", f"{elapsed_ms}ms", GREEN)
+
     return response.text
 
 # ── Output Parsing ────────────────────────────────────────────────────────────
 
 def parse_output(raw: str) -> dict:
+    """
+    Extract JSON from models that may include reasoning (<think> blocks, etc).
+    We deterministically locate the first valid JSON object.
+    """
+
     if not raw or not raw.strip():
         raise ModelExecutionError("Model returned an empty response.")
-    try:
-        return json.loads(raw.strip())
-    except json.JSONDecodeError as e:
+
+    text = raw.strip()
+
+    # Remove DeepSeek-style thinking blocks
+    if "<think>" in text:
+        text = text.split("</think>")[-1].strip()
+
+    # Find first JSON object deterministically
+    start = text.find("{")
+    end   = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
         raise ModelExecutionError(
-            f"Model returned invalid JSON.\n"
-            f"  Parse error: {e}\n"
-            f"  Raw output (first 500 chars):\n    {raw[:500]}"
+            "Model did not return a JSON object.\n"
+            f"Raw output (first 500 chars):\n{text[:500]}"
         )
 
+    json_str = text[start:end + 1]
+
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ModelExecutionError(
+            f"Model returned malformed JSON after extraction.\n"
+            f"Error: {e}\nExtracted:\n{json_str[:500]}"
+        )
 # ── Output Validation ─────────────────────────────────────────────────────────
 
 def validate_output(data: dict, output_schema: dict) -> None:
@@ -775,7 +890,7 @@ def run_behavior(name: str, input_data: dict) -> tuple[dict, dict]:
 
     system_prompt = build_system_prompt(output_schema)
     user_prompt   = build_user_prompt(input_data)
-    raw           = call_gemini(model_cfg, system_prompt, user_prompt)
+    raw           = call_model(model_cfg, system_prompt, user_prompt)
 
     data = parse_output(raw)
 

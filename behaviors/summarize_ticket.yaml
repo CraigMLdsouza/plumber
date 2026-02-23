@@ -1,5 +1,10 @@
 name: summarize_ticket
-model: {provider: gemini, name: gemini-2.5-flash, temperature: 0.2}
+
+model:
+  provider: ollama
+  name: phi3:mini
+  temperature: 0.1
+
 input: {schema: {ticket_text: string}}
 output:
   schema:

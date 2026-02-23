@@ -1,0 +1,19 @@
+source,content,error,reason
+event,"Dropped my card at the booth. Interested in the ""ScholarSuite"" education ERP.","Model returned malformed JSON after extraction.
+Error: Expecting property name enclosed in double quotes: line 5 column 1 (char 75)
+Extracted:
+{
+  ""intent"": ""buying"",
+  ""priority"": ""medium"",
+  ""segment"": ""enterprise"",
+dependent on the context of the event and the user's profile, which is not provided in the input. Assuming a generic enterprise user interested in a purchase, the ""segment"" would be ""enterprise"".
+  ""qualified"": true
+}",model_failure
+partner,Lead passed from our sales team. They need a white-label version of your dashboard.,"Ollama execution failed: Model did not return JSON. Raw output:
+{
+  ""intent"": ""buying"",
+  ""priority"": ""medium"",
+  ""segment"": ""enterprise"",
+ endocrinologist.",model_failure
+partner,"We are finalizing the RFP for a government project. Need your input on the ""AYUSH"" section.","Ollama execution failed: Model did not return JSON. Raw output:
+",model_failure

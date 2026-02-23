@@ -1,9 +1,9 @@
 name: extract_meeting
 
 model:
-  provider: gemini
-  name: gemini-2.5-flash
-  temperature: 0.0
+  provider: ollama
+  name: deepseek-r1:8b
+  temperature: 0.1
 
 input:
   schema:

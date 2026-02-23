@@ -1,0 +1,90 @@
+name: triage_lead
+
+model:
+  provider: ollama
+  name: phi3:mini
+  temperature: 0.0
+
+input:
+  schema:
+    source: string
+    content: string
+
+output:
+  schema:
+    intent:
+      type: enum
+      values: [buying, researching, support, unclear]
+
+    priority:
+      type: enum
+      values: [low, medium, high]
+
+    segment:
+      type: enum
+      values: [smb, midmarket, enterprise, unknown]
+
+    qualified: boolean
+
+validation:
+  required_keywords:
+    intent: []
+
+guidance:
+  intent_rules:
+    buying:
+      - asks for pricing
+      - asks for contract
+      - asks for demo
+      - says ready to move forward
+      - mentions rollout or purchase timeline
+
+    researching:
+      - comparing vendors
+      - evaluating options
+      - gathering information
+      - security documentation
+      - SLA questions
+
+    support:
+      - integration problem
+      - error
+      - cannot use product
+      - needs help
+
+    unclear:
+      - greeting only
+      - vague curiosity
+      - no actionable request
+
+  segment_rules:
+    enterprise:
+      - mentions team size
+      - licensing
+      - rollout
+      - security review
+      - procurement
+      - SLA
+
+    smb:
+      - small team
+      - quick setup
+      - self-serve
+
+    midmarket:
+      - departmental deployment
+      - integration discussion
+
+  priority_rules:
+    high:
+      - timeline mentioned
+      - demo requested
+      - referral
+      - decision language
+
+    medium:
+      - evaluating seriously
+      - technical discussion
+
+    low:
+      - curiosity only
