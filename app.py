@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 from langchain_community.llms import Ollama
 import yaml
+from threading import Lock
 # from google import genai
 # from google.genai import types
 
@@ -270,60 +271,77 @@ def call_ollama(model_cfg: dict, system_prompt: str, user_prompt: str) -> str:
     - forces JSON-only completion
     """
 
-    from langchain_community.llms import Ollama
+    # --- Global Ollama instance cache (keyed by model name + temperature) ---
+    # Reusing Ollama instances prevents cold-starts and unstable per-call
+    # instantiation. A lock protects the cache for concurrent access.
+    global _OLLAMA_CACHE, _OLLAMA_CACHE_LOCK
+    try:
+        _OLLAMA_CACHE
+    except NameError:
+        _OLLAMA_CACHE = {}
+        _OLLAMA_CACHE_LOCK = Lock()
 
-    model_name  = model_cfg.get("name", "phi3:mini")
+    model_name = model_cfg.get("name", "phi3:mini")
     temperature = float(model_cfg.get("temperature", 0.0))
 
     log("Calling model", f"{model_name} (LangChain Ollama) [temp={temperature}]", YELLOW)
     t0 = time.time()
 
+    # Enforce constrained, deterministic generation parameters
+    llm_key = (model_name, float(temperature))
+
     try:
-        llm = Ollama(
-            model=model_name,
-            temperature=temperature,
+        with _OLLAMA_CACHE_LOCK:
+            if llm_key not in _OLLAMA_CACHE:
+                # Instantiate once per unique config and reuse. Some versions of
+                # LangChain's Ollama do not accept extra kwargs like keep_alive;
+                # try with the preferred conservative params and fall back to a
+                # compatible constructor if needed.
+                try:
+                    _OLLAMA_CACHE[llm_key] = Ollama(
+                        model=model_name,
+                        temperature=temperature,
+                        num_predict=256,
+                        top_p=1,
+                        top_k=1,
+                        repeat_penalty=1.0,
+                        stop=["\n\n", "</think>"],
+                        keep_alive="30m",
+                        verbose=False,
+                    )
+                except Exception:
+                    # Fallback without keep_alive for compatibility
+                    _OLLAMA_CACHE[llm_key] = Ollama(
+                        model=model_name,
+                        temperature=temperature,
+                        num_predict=256,
+                        top_p=1,
+                        top_k=1,
+                        repeat_penalty=1.0,
+                        stop=["\n\n", "</think>"],
+                        verbose=False,
+                    )
 
-            # 🔴 CRITICAL SETTINGS (these make it fast + deterministic)
-            num_predict=256,      # hard cap output length
-            top_p=1,
-            top_k=1,
-            repeat_penalty=1.0,
-            stop=["\n\n", "</think>"],  # kill reasoning traces early
-
-            verbose=False,
-        )
+        llm = _OLLAMA_CACHE[llm_key]
 
         # FAIA-style prompt composition
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
         raw = llm.invoke(full_prompt)
-
         if not raw:
             raise ModelExecutionError("Model returned empty response")
 
         response = raw.strip()
 
-        # -------------------------------------------------
-        # 🧹 Hard cleanup layer (needed for ALL Ollama models)
-        # -------------------------------------------------
-
-        # Remove markdown fences
+        # Cleanup markdown/code fences and headers
         if "```" in response:
             parts = response.split("```")
-            # take the longest chunk (models often wrap JSON)
             response = max(parts, key=len).strip()
-
-        # If the model printed 'json' or 'JSON' header, remove it
         response = re.sub(r"^json\s*", "", response, flags=re.IGNORECASE).strip()
 
-        # Extract the first valid JSON object
-        match = re.search(r"\{.*\}", response, flags=re.DOTALL)
-        if not match:
-            raise ModelExecutionError(
-                f"Model did not return JSON. Raw output:\n{response[:500]}"
-            )
-
-        response = match.group(0)
+        # Use balanced-brace extraction to deterministically find the
+        # first complete JSON object (handles nested braces and strings).
+        response = extract_first_json_object(response)
 
     except Exception as e:
         raise ModelExecutionError(f"Ollama execution failed: {e}")
@@ -384,7 +402,6 @@ def parse_output(raw: str) -> dict:
     Extract JSON from models that may include reasoning (<think> blocks, etc).
     We deterministically locate the first valid JSON object.
     """
-
     if not raw or not raw.strip():
         raise ModelExecutionError("Model returned an empty response.")
 
@@ -394,25 +411,60 @@ def parse_output(raw: str) -> dict:
     if "<think>" in text:
         text = text.split("</think>")[-1].strip()
 
-    # Find first JSON object deterministically
-    start = text.find("{")
-    end   = text.rfind("}")
-
-    if start == -1 or end == -1 or end <= start:
-        raise ModelExecutionError(
-            "Model did not return a JSON object.\n"
-            f"Raw output (first 500 chars):\n{text[:500]}"
-        )
-
-    json_str = text[start:end + 1]
+    try:
+        obj_text = extract_first_json_object(text)
+    except ModelExecutionError:
+        raise
 
     try:
-        return json.loads(json_str)
+        return json.loads(obj_text)
     except json.JSONDecodeError as e:
         raise ModelExecutionError(
-            f"Model returned malformed JSON after extraction.\n"
-            f"Error: {e}\nExtracted:\n{json_str[:500]}"
+            f"Model returned malformed JSON after extraction.\nError: {e}\nExtracted:\n{obj_text[:500]}"
         )
+
+
+def extract_first_json_object(text: str) -> str:
+    """Return the first balanced JSON object substring from text.
+
+    This scans char-by-char, tracks brace depth, and respects string
+    quoting and escape sequences so braces inside strings are ignored.
+    Raises ModelExecutionError if no complete object is found.
+    """
+    start_idx = None
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if start_idx is None:
+            if ch == '{':
+                start_idx = i
+                depth = 1
+                in_string = False
+                escape = False
+            else:
+                continue
+        else:
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    # return the full balanced object
+                    return text[start_idx:i + 1]
+
+    raise ModelExecutionError("Model did not return a complete JSON object.")
 # ── Output Validation ─────────────────────────────────────────────────────────
 
 def validate_output(data: dict, output_schema: dict) -> None:
@@ -694,6 +746,7 @@ def apply_validation_rules(data: dict, rules: dict, output_schema: dict) -> None
 VALID_TOP_LEVEL_KEYS = {
     "name", "model", "input", "output",
     "validation", "normalization", "missing", "defaults",
+    "guidance",
 }
 VALID_SCHEMA_TYPES = {
     "string", "integer", "float", "boolean", "datetime", "enum", "array",
@@ -864,6 +917,109 @@ def lint_behavior(name: str) -> None:
 
 # ── Core Runtime ──────────────────────────────────────────────────────────────
 
+def _select_text_field(input_schema: dict, input_data: dict) -> tuple[str, str] | tuple[None, None]:
+    """Return (field_name, text) for the most likely textual input field.
+    Preference: 'content', 'ticket_text', else first string field present in input_data.
+    """
+    preferred = ["content", "ticket_text", "body", "text"]
+    for p in preferred:
+        if p in input_schema and p in input_data and isinstance(input_data[p], str):
+            return p, input_data[p]
+    # fallback: first string field in schema
+    for k, spec in input_schema.items():
+        if k in input_data and isinstance(input_data[k], str):
+            return k, input_data[k]
+    return None, None
+
+
+def pre_classify_by_guidance(behavior: dict, input_schema: dict, input_data: dict, output_schema: dict) -> dict | None:
+    """Attempt deterministic pre-classification using guidance.rules.
+
+    Returns a complete output dict only when a confident, deterministic
+    mapping can be produced that satisfies the output schema; otherwise
+    returns None to indicate fallback to the LLM.
+    """
+    guidance = behavior.get("guidance", {})
+    intent_rules = guidance.get("intent_rules")
+    if not intent_rules:
+        return None
+
+    field_name, text = _select_text_field(input_schema, input_data)
+    if not text:
+        return None
+    text_l = text.lower()
+
+    # Score intents by keyword occurrences
+    scores = {}
+    for label, kws in intent_rules.items():
+        cnt = 0
+        for kw in (kws or []):
+            if kw.lower() in text_l:
+                cnt += 1
+        scores[label] = cnt
+
+    # Determine confident winner: top > 0 and no other has same count
+    sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    if not sorted_scores:
+        return None
+    top_label, top_score = sorted_scores[0]
+    second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0
+    if top_score <= 0 or top_score == second_score:
+        return None
+
+    # Only short-circuit when output schema contains the common triage fields
+    required_keys = {"intent", "priority", "segment", "qualified"}
+    if not required_keys.issubset(set(output_schema.keys())):
+        return None
+
+    # Build a deterministic output using safe defaults drawn from schema
+    out = {}
+    # intent
+    out["intent"] = top_label
+
+    # priority — pick 'low' if present otherwise first allowed value
+    pr_spec = output_schema["priority"]
+    pr_vals = pr_spec.get("values", []) if isinstance(pr_spec, dict) else []
+    out["priority"] = "low" if "low" in pr_vals else (pr_vals[0] if pr_vals else "low")
+
+    # segment — prefer 'unknown' if present
+    seg_spec = output_schema["segment"]
+    seg_vals = seg_spec.get("values", []) if isinstance(seg_spec, dict) else []
+    out["segment"] = "unknown" if "unknown" in seg_vals else (seg_vals[0] if seg_vals else "unknown")
+
+    # qualified — default to False
+    out["qualified"] = False
+
+    return out
+
+
+def normalize_before_validation(data: dict, output_schema: dict) -> dict:
+    """Repair minor formatting issues before strict validation.
+
+    - strip whitespace from string fields
+    - lowercase enum values
+    - coerce boolean-like strings to booleans (true/false/yes/no)
+    This performs minimal repairs only; it does not relax structural rules.
+    """
+    repaired = dict(data)
+    for field, spec in output_schema.items():
+        if field not in repaired:
+            continue
+        val = repaired[field]
+        ftype = _get_field_type(spec)
+        if isinstance(val, str):
+            s = val.strip()
+            if ftype == "enum":
+                s = s.lower()
+            repaired[field] = s
+            # boolean-like conversions
+            if ftype == "boolean":
+                low = s.lower()
+                if low in ("true", "false", "yes", "no"):
+                    repaired[field] = low in ("true", "yes")
+        # No other types are mutated here
+    return repaired
+
 def run_behavior(name: str, input_data: dict) -> tuple[dict, dict]:
     """
     Execute a named behavior against the given input.
@@ -887,19 +1043,97 @@ def run_behavior(name: str, input_data: dict) -> tuple[dict, dict]:
     behavior_hash = behavior["__hash__"]
 
     validate_input(input_data, input_schema)
-
     system_prompt = build_system_prompt(output_schema)
-    user_prompt   = build_user_prompt(input_data)
-    raw           = call_model(model_cfg, system_prompt, user_prompt)
+    user_prompt = build_user_prompt(input_data)
 
-    data = parse_output(raw)
+    # --- Trivial short-circuit for tiny inputs ---
+    text_field_name, text_field_value = _select_text_field(input_schema, input_data)
+    if text_field_value is not None and len(text_field_value.strip()) < 10:
+        # Deterministic fallback for tiny/empty leads
+        out = {
+            "intent": "unclear",
+            "priority": "low",
+            "segment": "unknown",
+            "qualified": False,
+        }
+        total_ms = int((time.time() - wall_start) * 1000)
+        trace = {
+            "behavior": name,
+            "behavior_hash": behavior_hash,
+            "model": model_cfg.get("name", "ollama"),
+            "latency_ms": total_ms,
+            "validated": True,
+            "decision_mode": "deterministic",
+        }
+        log("Short-circuit", "Tiny input — returned deterministic default", YELLOW)
+        return out, trace
 
-    # Execution order (Change 11):
-    # 1. type/schema validation
+    # --- Deterministic pre-classification using guidance rules (optional) ---
+    deterministic_output = pre_classify_by_guidance(behavior, input_schema, input_data, output_schema)
+    if deterministic_output is not None:
+        # Repair and validate the deterministic output before returning
+        repaired = normalize_before_validation(deterministic_output, output_schema)
+        validate_output(repaired, output_schema)
+        repaired = apply_missing_and_defaults(repaired, output_schema, missing_cfg, defaults)
+        repaired = apply_normalization(repaired, normalization, output_schema)
+        apply_validation_rules(repaired, rules, output_schema)
+
+        total_ms = int((time.time() - wall_start) * 1000)
+        trace = {
+            "behavior": name,
+            "behavior_hash": behavior_hash,
+            "model": model_cfg.get("name", "ollama"),
+            "latency_ms": total_ms,
+            "validated": True,
+            "decision_mode": "deterministic",
+        }
+        log("Pre-classify", f"returned deterministic output for behavior {name}", GREEN)
+        return repaired, trace
+
+    # --- LLM path with one retry for malformed JSON ---
+    attempt = 0
+    last_raw = None
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        try:
+            raw = call_model(model_cfg, system_prompt, user_prompt)
+            last_raw = raw
+            data = parse_output(raw)
+            # Successful parse -> break
+            break
+        except ModelExecutionError as e:
+            last_err = e
+            # If first attempt, retry once with stricter system instruction
+            if attempt == 1:
+                log("Model retry", "JSON parse failed — retrying once with stricter instruction", YELLOW)
+                system_prompt = system_prompt + "\n\nReturn ONLY valid JSON. Do not explain."
+                continue
+            # second failure: persist the raw output to failures.log and re-raise
+            try:
+                with open("failures.log", "a", encoding="utf-8") as fh:
+                    fh.write("---\n")
+                    fh.write(f"timestamp: {datetime.utcnow().isoformat()}Z\n")
+                    fh.write(f"behavior: {name}\n")
+                    fh.write(f"model: {model_cfg.get('name', 'ollama')}\n")
+                    fh.write(f"error: {repr(last_err)}\n")
+                    fh.write("raw:\n")
+                    fh.write((last_raw or "<no raw>")[:20000])
+                    fh.write("\n---\n")
+            except Exception:
+                # Do not fail because of logging; keep original error
+                pass
+            raise ModelExecutionError(f"Model failed after retry: {last_err}")
+
+    # --- Pre-validate normalization (repair minor issues) ---
+    data = normalize_before_validation(data, output_schema)
+
+    # Execution order:
+    # 1. strict type/schema validation
     validate_output(data, output_schema)
     # 2. apply missing strategy + defaults
     data = apply_missing_and_defaults(data, output_schema, missing_cfg, defaults)
-    # 3. normalization
+    # 3. normalization (behavior-defined)
     data = apply_normalization(data, normalization, output_schema)
     # 4. validation rules
     apply_validation_rules(data, rules, output_schema)
@@ -913,9 +1147,10 @@ def run_behavior(name: str, input_data: dict) -> tuple[dict, dict]:
     trace = {
         "behavior":      name,
         "behavior_hash": behavior_hash,
-        "model":         model_cfg.get("name", "gemini-2.5-flash"),
+        "model":         model_cfg.get("name", "ollama"),
         "latency_ms":    total_ms,
         "validated":     True,
+        "decision_mode": "llm",
     }
     return data, trace
 
