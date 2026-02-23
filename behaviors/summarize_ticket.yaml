@@ -1,0 +1,24 @@
+name: summarize_ticket
+
+model:
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.2
+
+input:
+  schema:
+    ticket_text: string
+
+output:
+  schema:
+    summary: string
+    priority:
+      type: enum
+      values: [low, medium, high]
+
+normalization:
+  strip: [summary]
+
+validation:
+  max_length:
+    summary: 120
